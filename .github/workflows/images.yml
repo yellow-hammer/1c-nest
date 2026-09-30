@@ -11,6 +11,10 @@ on:
         description: '1C:EDT: линейки или версии через пробел ("2026.1"); пусто - из versions.json; "-" - не собирать'
         required: false
         default: ''
+      tools:
+        description: 'Собрать onescript и downloader'
+        type: boolean
+        default: false
       publish:
         description: 'Опубликовать в ghcr.io'
         type: boolean
@@ -24,25 +28,31 @@ on:
   push:
     branches: [main]
     paths:
-      - 'platform/**'
+      - 'server/**'
+      - 'client/**'
+      - 'vnc/**'
+      - 'onescript/**'
+      - 'downloader/**'
       - 'vrunner/**'
       - 'edt/**'
       - 'scripts/**'
       - 'tests/smoke.sh'
       - 'tests/fixtures/**'
       - 'versions.json'
-      - '.github/actions/**'
       - '.github/workflows/images.yml'
   pull_request:
     paths:
-      - 'platform/**'
+      - 'server/**'
+      - 'client/**'
+      - 'vnc/**'
+      - 'onescript/**'
+      - 'downloader/**'
       - 'vrunner/**'
       - 'edt/**'
       - 'scripts/**'
       - 'tests/smoke.sh'
       - 'tests/fixtures/**'
       - 'versions.json'
-      - '.github/actions/**'
       - '.github/workflows/images.yml'
 
 permissions: {}
@@ -63,6 +73,8 @@ jobs:
       actions: read
       packages: read
     outputs:
+      changed: ${{ steps.plan.outputs.changed }}
+      tools: ${{ steps.plan.outputs.tools }}
       platform: ${{ steps.plan.outputs.platform }}
       edt: ${{ steps.plan.outputs.edt }}
       publish: ${{ steps.plan.outputs.publish }}
@@ -73,8 +85,10 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Установить OneScript и yard
-        uses: ./.github/actions/setup-yard
+      - name: Собрать загрузчик
+        run: |
+          docker build -q -t 1c-nest-build/onescript onescript
+          docker build -q --build-arg BASE_IMAGE=1c-nest-build/onescript -t 1c-nest-build/downloader downloader
 
       - name: Войти в ghcr.io
         if: github.event_name == 'schedule' || inputs.new_only
@@ -84,21 +98,71 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Выбрать версии
+      - name: Выбрать кубики и версии
         id: plan
         env:
           EVENT: ${{ github.event_name }}
           REF: ${{ github.ref }}
           PLATFORM: ${{ inputs.platform }}
           EDT: ${{ inputs.edt }}
+          TOOLS: ${{ inputs.tools }}
           PUBLISH: ${{ inputs.publish }}
           NEW_ONLY: ${{ inputs.new_only }}
           BASE: ${{ github.event.pull_request.base.sha }}
           HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
           GH_TOKEN: ${{ github.token }}
-          YARD_RELEASES_USER: ${{ secrets.ONEC_LOGIN }}
-          YARD_RELEASES_PWD: ${{ secrets.ONEC_PASSWORD }}
+          DOWNLOADER_IMAGE: 1c-nest-build/downloader
+          ONEC_LOGIN: ${{ secrets.ONEC_LOGIN }}
+          ONEC_PASSWORD: ${{ secrets.ONEC_PASSWORD }}
         run: bash scripts/plan.sh
+
+  tools:
+    name: OneScript и загрузчик
+    needs: plan
+    if: needs.plan.outputs.tools == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      PUBLISH: ${{ needs.plan.outputs.publish }}
+    steps:
+      - name: Получить код
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Параметры образов
+        run: |
+          {
+            echo "IMAGE_PREFIX=ghcr.io/${GITHUB_REPOSITORY,,}"
+            echo "IMAGE_SOURCE=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+            echo "IMAGE_REVISION=$GITHUB_SHA"
+          } >> "$GITHUB_ENV"
+
+      - name: Собрать образы
+        run: |
+          bash scripts/build.sh tools > "$RUNNER_TEMP/images"
+          docker image ls "$IMAGE_PREFIX/*"
+
+      - name: Проверить образы
+        env:
+          ONEC_LOGIN: ${{ secrets.ONEC_LOGIN }}
+          ONEC_PASSWORD: ${{ secrets.ONEC_PASSWORD }}
+        run: bash tests/smoke.sh "$RUNNER_TEMP/images"
+
+      - name: Войти в ghcr.io
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Опубликовать
+        if: env.PUBLISH == 'true'
+        run: bash scripts/publish.sh "$RUNNER_TEMP/images"
 
   platform:
     name: Платформа ${{ matrix.version }}
@@ -130,23 +194,24 @@ jobs:
             echo "IMAGE_PREFIX=ghcr.io/${GITHUB_REPOSITORY,,}"
             echo "IMAGE_SOURCE=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
             echo "IMAGE_REVISION=$GITHUB_SHA"
-            echo "DISTR=$RUNNER_TEMP/distr"
           } >> "$GITHUB_ENV"
           df -h /
 
-      - name: Установить OneScript и yard
-        uses: ./.github/actions/setup-yard
-
-      - name: Скачать дистрибутив
-        env:
-          YARD_RELEASES_USER: ${{ secrets.ONEC_LOGIN }}
-          YARD_RELEASES_PWD: ${{ secrets.ONEC_PASSWORD }}
-        run: bash scripts/distr.sh platform "$VERSION" "$DISTR"
+      # Неизменённые образы, на которых строятся изменённые, берутся из реестра
+      - name: Войти в ghcr.io
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Собрать образы
+        env:
+          CHANGED: ${{ needs.plan.outputs.changed }}
+          ONEC_LOGIN: ${{ secrets.ONEC_LOGIN }}
+          ONEC_PASSWORD: ${{ secrets.ONEC_PASSWORD }}
         run: |
-          bash scripts/build.sh platform "$VERSION" "$DISTR" > "$RUNNER_TEMP/images"
-          rm -rf "$DISTR"
+          bash scripts/build.sh platform "$VERSION" > "$RUNNER_TEMP/images"
           docker builder prune -af > /dev/null
           docker image ls "$IMAGE_PREFIX/*"
           while read -r image; do
@@ -155,15 +220,7 @@ jobs:
           df -h /
 
       - name: Проверить образы
-        run: bash tests/smoke.sh platform "$VERSION"
-
-      - name: Войти в ghcr.io
-        if: env.PUBLISH == 'true'
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+        run: bash tests/smoke.sh "$RUNNER_TEMP/images"
 
       - name: Опубликовать
         if: env.PUBLISH == 'true'
@@ -199,23 +256,15 @@ jobs:
             echo "IMAGE_PREFIX=ghcr.io/${GITHUB_REPOSITORY,,}"
             echo "IMAGE_SOURCE=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
             echo "IMAGE_REVISION=$GITHUB_SHA"
-            echo "DISTR=$RUNNER_TEMP/distr"
           } >> "$GITHUB_ENV"
           df -h /
 
-      - name: Установить OneScript и yard
-        uses: ./.github/actions/setup-yard
-
-      - name: Скачать дистрибутив
-        env:
-          YARD_RELEASES_USER: ${{ secrets.ONEC_LOGIN }}
-          YARD_RELEASES_PWD: ${{ secrets.ONEC_PASSWORD }}
-        run: bash scripts/distr.sh edt "$VERSION" "$DISTR"
-
       - name: Собрать образ
+        env:
+          ONEC_LOGIN: ${{ secrets.ONEC_LOGIN }}
+          ONEC_PASSWORD: ${{ secrets.ONEC_PASSWORD }}
         run: |
-          bash scripts/build.sh edt "$VERSION" "$DISTR" > "$RUNNER_TEMP/images"
-          rm -rf "$DISTR"
+          bash scripts/build.sh edt "$VERSION" > "$RUNNER_TEMP/images"
           docker builder prune -af > /dev/null
           docker image ls "$IMAGE_PREFIX/*"
           while read -r image; do
@@ -224,7 +273,7 @@ jobs:
           df -h /
 
       - name: Проверить образ
-        run: bash tests/smoke.sh edt "$VERSION"
+        run: bash tests/smoke.sh "$RUNNER_TEMP/images"
 
       - name: Войти в ghcr.io
         if: env.PUBLISH == 'true'

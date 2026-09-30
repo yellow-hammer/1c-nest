@@ -26,9 +26,9 @@ jobs:
       - name: shellcheck
         run: |
           docker run --rm -v "$PWD:/repo" -w /repo koalaman/shellcheck-alpine:v0.11.0 sh -c '
-            shellcheck scripts/*.sh platform/deps.sh tests/smoke.sh tests/display/run.sh &&
-            shellcheck -s sh platform/rootfs/usr/local/bin/1c-nest-display vrunner/rootfs/usr/local/bin/vrunner \
-              edt/1cedtcli.in tests/display/fake-vrunner'
+            shellcheck scripts/*.sh client/deps.sh downloader/onec-download tests/smoke.sh tests/display/run.sh &&
+            shellcheck -s sh client/rootfs/usr/local/bin/1c-nest-display server/rootfs/usr/local/bin/1c-nest-server \
+              vrunner/rootfs/usr/local/bin/vrunner edt/1cedtcli.in tests/display/fake-vrunner'
 
       - name: actionlint
         run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color

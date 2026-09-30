@@ -1,10 +1,19 @@
 # 1C:EDT с консолью 1cedtcli, без графики: ENTRYPOINT 1cedtcli.
-# Распакованный офлайн-дистрибутив для Linux (с 1ce-installer-cli) подключается именованным
-# контекстом и в слои не попадает:
-#   docker build --build-context distr=<каталог дистрибутива> --build-arg EDT_VERSION=<версия> \
+# Дистрибутив скачивается при сборке, учётная запись releases.1c.ru передаётся секретами из переменных
+# ONEC_LOGIN и ONEC_PASSWORD:
+#   docker build --secret id=ONEC_LOGIN --secret id=ONEC_PASSWORD --build-arg EDT_VERSION=<версия> \
 #     -t edt:<версия> edt
+# Каталог с распакованным офлайн-дистрибутивом для Linux (с 1ce-installer-cli) подставляется вместо скачивания:
+#   docker build --build-context distr=<каталог> --build-arg EDT_VERSION=<версия> -t edt:<версия> edt
 
+ARG DOWNLOADER_IMAGE=ghcr.io/yellow-hammer/1c-nest/downloader:latest
 ARG BASE_IMAGE=ubuntu:22.04
+
+FROM ${DOWNLOADER_IMAGE} AS distr
+ARG EDT_VERSION
+RUN --mount=type=secret,id=ONEC_LOGIN,env=ONEC_LOGIN,required=true \
+    --mount=type=secret,id=ONEC_PASSWORD,env=ONEC_PASSWORD,required=true \
+    onec-download edt "${EDT_VERSION:?}" /distr
 
 # Установщикам до 2025.1 нужна Java в системе
 FROM eclipse-temurin:17-jdk-jammy AS install
@@ -18,11 +27,11 @@ RUN apt-get update \
  && localedef -i ru_RU -c -f UTF-8 -A /usr/share/locale/locale.alias ru_RU.UTF-8
 ENV LANG=ru_RU.UTF-8 LC_ALL=ru_RU.UTF-8
 
-# Установщик пишет рядом с собой: каталог подключается на запись, изменения отбрасываются
-RUN --mount=type=bind,from=distr,target=/distr,rw <<'EOF'
-installer=$(find /distr -type f -name 1ce-installer-cli | head -1)
+# Установщик пишет рядом с собой: дистрибутив подключается на запись, изменения отбрасываются
+RUN --mount=type=bind,from=distr,target=/mnt/distr,rw <<'EOF'
+installer=$(find /mnt/distr -type f -name 1ce-installer-cli | head -1)
 if [ -z "$installer" ]; then
-	echo 'В контексте distr нет 1ce-installer-cli' >&2
+	echo 'В дистрибутиве нет 1ce-installer-cli' >&2
 	exit 1
 fi
 cd "$(dirname "$installer")"

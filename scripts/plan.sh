@@ -1,15 +1,18 @@
 #!/bin/bash
-# План сборки в CI: какие версии собирать и публиковать ли.
+# План сборки в CI: какие кубики и версии собирать и публиковать ли.
 # Переменные среды:
-#   EVENT          событие: workflow_dispatch, schedule, push, pull_request
-#   REF            ветка запуска
-#   PLATFORM, EDT  линейки или точные версии через пробел; пусто - из versions.json, "-" - не собирать
-#   PUBLISH        публиковать ли при workflow_dispatch; публикуются только образы из main
-#   NEW_ONLY       true - пропустить версии, которые уже опубликованы (по расписанию всегда);
-#                  нужен вход в ghcr.io
-#   BASE, HEAD     коммиты запроса на слияние: собираются только образы, чьи файлы изменились.
-#                  Для push BASE - коммит последней успешной публикации (нужен gh с GH_TOKEN)
-# В $GITHUB_OUTPUT: platform и edt (JSON-массивы {version, line}), publish.
+#   EVENT             событие: workflow_dispatch, schedule, push, pull_request
+#   REF               ветка запуска
+#   PLATFORM, EDT     линейки или точные версии через пробел; пусто - из versions.json, "-" - не собирать
+#   TOOLS             собирать ли onescript и downloader при workflow_dispatch
+#   PUBLISH           публиковать ли при workflow_dispatch; публикуются только образы из main
+#   NEW_ONLY          true - пропустить версии, которые уже опубликованы (по расписанию всегда);
+#                     нужен вход в ghcr.io
+#   BASE, HEAD        коммиты запроса на слияние: собираются изменённые кубики и то, что на них построено.
+#                     Для push BASE - коммит последней успешной публикации (нужен gh с GH_TOKEN)
+#   DOWNLOADER_IMAGE  образ загрузчика для поиска сборок линеек, учётная запись в ONEC_LOGIN и ONEC_PASSWORD
+# В $GITHUB_OUTPUT: changed (кубики через пробел или all), tools, platform и edt (JSON-массивы
+# {version, line}), publish.
 set -euo pipefail
 shopt -s inherit_errexit
 
@@ -25,38 +28,46 @@ last_published() {
 	fi
 }
 
-# Какие образы затрагивают изменения; без базы - все
+# Изменённые кубики через пробел; без базы и при изменении общих файлов - all
 affected() {
-	local files
+	local files file cubes=()
 	if [ -z "${BASE:-}" ] || ! files=$(git -c core.quotePath=false diff --name-only "$BASE...${HEAD:-HEAD}" 2>/dev/null); then
-		echo 'platform edt'
+		echo all
 		return
 	fi
-	local platform=0 edt=0 file
 	while IFS= read -r file; do
 		case $file in
-		platform/* | vrunner/*) platform=1 ;;
-		edt/* | tests/fixtures/*) edt=1 ;;
-		scripts/* | tests/smoke.sh | versions.json | .github/workflows/images.yml | .github/actions/*)
-			platform=1
-			edt=1
+		server/* | client/* | vnc/* | onescript/* | downloader/* | vrunner/* | edt/*) cubes+=("${file%%/*}") ;;
+		tests/fixtures/*) cubes+=(edt) ;;
+		scripts/* | tests/smoke.sh | versions.json | .github/workflows/images.yml)
+			echo all
+			return
 			;;
 		esac
 	done <<<"$files"
-	[ "$platform" = 1 ] && printf 'platform '
-	[ "$edt" = 1 ] && printf 'edt'
-	echo
+	[ ${#cubes[@]} -eq 0 ] || printf '%s\n' "${cubes[@]}" | sort -u | paste -sd ' '
 }
 
-# Опубликована ли версия целиком: последний тег, который отправляет публикация
+has() {
+	[[ " $changed " == *" all "* ]] && return 0
+	local cube
+	for cube in "$@"; do
+		[[ " $changed " == *" $cube "* ]] && return 0
+	done
+	return 1
+}
+
+# Опубликована ли версия целиком: первый и последний образы, которые отправляет публикация
 published() {
 	local kind=$1 version=$2 prefix image
 	prefix="ghcr.io/${GITHUB_REPOSITORY,,}"
 	case $kind in
-	platform) image="$prefix/vrunner:$version-vrunner2-vnc" ;;
-	edt) image="$prefix/edt:$version" ;;
+	platform) set -- "$prefix/server:$version" "$prefix/vrunner:$version-vrunner2-vnc" ;;
+	edt) set -- "$prefix/edt:$version" ;;
 	esac
-	docker manifest inspect "$image" >/dev/null 2>&1
+	for image; do
+		docker manifest inspect "$image" >/dev/null 2>&1 || return 1
+	done
 }
 
 # $1 - platform или edt, $2 - запрошенное; печатает JSON-массив {version, line}
@@ -75,7 +86,7 @@ resolve() {
 			version=$item
 			line=
 		else
-			version=$(bash scripts/distr.sh latest "$kind" "$item")
+			version=$(docker run --rm -e ONEC_LOGIN -e ONEC_PASSWORD "${DOWNLOADER_IMAGE:?}" latest "$kind" "$item")
 			line=$item
 		fi
 		if [ "$new_only" = true ] && published "$kind" "$version"; then
@@ -90,6 +101,8 @@ resolve() {
 
 platform=${PLATFORM:-}
 edt=${EDT:-}
+changed=all
+tools=false
 publish=false
 new_only=${NEW_ONLY:-false}
 case $EVENT in
@@ -98,6 +111,7 @@ schedule)
 	new_only=true
 	;;
 workflow_dispatch)
+	tools=${TOOLS:-false}
 	if [ "${PUBLISH:-false}" = true ]; then
 		if [ "${REF:-}" = refs/heads/main ]; then
 			publish=true
@@ -111,15 +125,19 @@ workflow_dispatch)
 		publish=true
 		BASE=$(last_published)
 	fi
-	scope=$(affected)
-	[[ $scope == *platform* ]] || platform=-
-	[[ $scope == *edt* ]] || edt=-
+	changed=$(affected)
+	has onescript downloader && tools=true
+	has server client vnc onescript vrunner || platform=-
+	has edt || edt=-
 	;;
 esac
+echo "Кубики: ${changed:-нет}" >&2
 
 platform=$(resolve platform "$platform")
 edt=$(resolve edt "$edt")
 {
+	echo "changed=$changed"
+	echo "tools=$tools"
 	echo "platform=$platform"
 	echo "edt=$edt"
 	echo "publish=$publish"
