@@ -1,0 +1,48 @@
+#!/bin/sh
+# Поддельный vrunner для проверки обёртки: вместо 1С запускает X-программы
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+case $cmd in
+--version | version)
+	echo 3.0.2
+	;;
+check)
+	echo "DISPLAY=${DISPLAY:-<unset>} HOME=$HOME uid=$(id -u)"
+	if [ -n "${DISPLAY:-}" ]; then
+		xdpyinfo 2>&1 | grep -E 'name of display' || echo 'xdpyinfo failed'
+	fi
+	mkdir -p "$HOME/.1cv8/1C/1cv8" && echo "home writable: $HOME/.1cv8"
+	exit "${1:-0}"
+	;;
+gui)
+	# gui СЕКУНДЫ [--no-wait]: окно xeyes; с --no-wait не дожидается его закрытия
+	secs=${1:-5}
+	if [ "${2:-}" = --no-wait ]; then
+		timeout --foreground "$secs" xeyes >/dev/null 2>&1 &
+		exit 0
+	fi
+	timeout --foreground "$secs" xeyes
+	;;
+term)
+	# term СЕКУНДЫ ФАЙЛ: ждёт; по TERM пишет в файл и закрывается ещё 2 с
+	secs=${1:-60}
+	mark=${2:-/dev/null}
+	trap 'echo "TERM received" >>"$mark"; sleep 2; echo "graceful done" >>"$mark"; exit 143' TERM
+	echo started >>"$mark"
+	sleep "$secs" &
+	wait $!
+	;;
+orphan)
+	# orphan ФАЙЛ: клиент переживает vrunner и закрывается по TERM 2 с
+	mark=${1:-/dev/null}
+	sh -c 'trap "echo client TERM >>\$0; sleep 2; echo client graceful done >>\$0; exit 0" TERM; sleep 600 & wait $!' "$mark" &
+	echo 'vrunner started client' >>"$mark"
+	sleep 600
+	;;
+stdin)
+	read -r line && echo "stdin: $line"
+	;;
+*)
+	echo "fake vrunner: $cmd $*"
+	;;
+esac

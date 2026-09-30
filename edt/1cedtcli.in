@@ -1,0 +1,10 @@
+#!/bin/sh
+# 1cedtcli. Запущенный от root идёт под владельцем рабочего каталога, если это не root
+# и не задано ONEC_NEST_AS_OWNER=0
+if [ "$(id -u)" = 0 ] && [ "${ONEC_NEST_AS_OWNER:-1}" != 0 ]; then
+	owner=$(stat -c %u:%g .)
+	if [ "${owner%%:*}" != 0 ]; then
+		exec setpriv --reuid="${owner%%:*}" --regid="${owner#*:}" --clear-groups -- "$0" "$@"
+	fi
+fi
+exec /opt/1C/1CE/edt/@CLI@ "$@"
