@@ -36,11 +36,16 @@ ms() {
 	date +%s%3N
 }
 
+# Те же слои, что у образов vrunner, поверх клиента без платформы
 build() {
-	docker build -q --target runtime --build-arg ONEC_VERSION=8.3.27.1 -t $T/runtime platform &&
-		docker build -q --target vrunner --build-arg BASE_IMAGE=$T/runtime -t $T/vrunner vrunner &&
-		docker build -q --target vrunner2 --build-arg BASE_IMAGE=$T/runtime -t $T/vrunner2 vrunner &&
-		docker build -q --target vnc --build-arg BASE_IMAGE=$T/runtime --build-arg FLAVOR=vrunner -t $T/vnc vrunner &&
+	docker build -q --target runtime --build-arg ONEC_VERSION=8.3.27.1 -t $T/runtime client &&
+		docker build -q --build-arg BASE_IMAGE=$T/runtime -t $T/runtime-vnc vnc &&
+		docker build -q --build-arg BASE_IMAGE=$T/runtime -t $T/onescript onescript &&
+		docker build -q --build-arg BASE_IMAGE=$T/runtime --build-arg ONESCRIPT_VERSION=1.9.4 -t $T/onescript1 onescript &&
+		docker build -q --build-arg BASE_IMAGE=$T/runtime-vnc -t $T/onescript-vnc onescript &&
+		docker build -q --build-arg BASE_IMAGE=$T/onescript -t $T/vrunner vrunner &&
+		docker build -q --build-arg BASE_IMAGE=$T/onescript1 --build-arg VRUNNER_VERSION=2.6.1 -t $T/vrunner2 vrunner &&
+		docker build -q --build-arg BASE_IMAGE=$T/onescript-vnc -t $T/vnc vrunner &&
 		docker build -q --build-arg BASE=$T/vrunner -t $X tests/display &&
 		docker build -q --build-arg BASE=$T/vnc -t $V tests/display
 }

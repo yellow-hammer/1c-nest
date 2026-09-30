@@ -1,10 +1,10 @@
 #!/bin/bash
 # Дистрибутивы 1С с releases.1c.ru через yard.
-#   distr.sh latest platform <линейка>   последняя сборка линейки: 8.3.27 -> 8.3.27.2342
-#   distr.sh latest edt <линейка>        2026.1 -> 2026.1.3
-#   distr.sh platform <версия> <каталог> установщик setup-full-<версия>-x86_64.run
-#   distr.sh edt <версия> <каталог>      распакованный офлайн-дистрибутив 1C:EDT для Linux
-# Учётные данные: YARD_RELEASES_USER, YARD_RELEASES_PWD. Нужны yard, jq, unzip, tar.
+#   onec-download latest platform <линейка>    последняя сборка линейки: 8.3.27 -> 8.3.27.2342
+#   onec-download latest edt <линейка>         2026.1 -> 2026.1.3
+#   onec-download platform <версия> <каталог>  установщик setup-full-<версия>-x86_64.run
+#   onec-download edt <версия> <каталог>       распакованный офлайн-дистрибутив 1C:EDT для Linux
+# Учётная запись: ONEC_LOGIN и ONEC_PASSWORD или YARD_RELEASES_USER и YARD_RELEASES_PWD.
 set -euo pipefail
 shopt -s inherit_errexit
 
@@ -17,11 +17,9 @@ die() {
 	exit 1
 }
 
-if [ -n "${YARD_OS:-}" ]; then
-	yard=(oscript "$YARD_OS")
-else
-	yard=(yard)
-fi
+usage() {
+	sed -n '2,7s/^# \{0,1\}//p' "$0"
+}
 
 # Фильтры yard - регулярные выражения без привязки к началу и концу строки
 escape() {
@@ -37,6 +35,14 @@ edt_app() {
 	printf '^1C:Enterprise Development Tools$'
 }
 
+credentials() {
+	export YARD_RELEASES_USER=${YARD_RELEASES_USER:-${ONEC_LOGIN:-}}
+	export YARD_RELEASES_PWD=${YARD_RELEASES_PWD:-${ONEC_PASSWORD:-}}
+	if [ -z "$YARD_RELEASES_USER" ] || [ -z "$YARD_RELEASES_PWD" ]; then
+		die 'Нет учётной записи releases.1c.ru: задайте ONEC_LOGIN и ONEC_PASSWORD'
+	fi
+}
+
 # yard не повторяет запросы и завершается с кодом 0, когда ничего не нашёл:
 # итог проверяет команда из первого аргумента.
 # В журнале yard прямые ссылки на файлы дистрибутива: он печатается только при ошибке и без них
@@ -45,7 +51,7 @@ attempt() {
 	shift
 	output=$(mktemp)
 	for try in 1 2 3; do
-		timeout "${YARD_TIMEOUT:-1800}" "${yard[@]}" "$@" >"$output" 2>&1 || true
+		timeout "${YARD_TIMEOUT:-1800}" yard "$@" >"$output" 2>&1 || true
 		if eval "$check"; then
 			rm -f "$output"
 			return 0
@@ -129,8 +135,21 @@ edt() {
 }
 
 case ${1:-} in
-latest) latest "${2:?вид: platform или edt}" "${3:?линейка}" ;;
-platform) platform "${2:?версия}" "${3:?каталог}" ;;
-edt) edt "${2:?версия}" "${3:?каталог}" ;;
-*) die "Использование: distr.sh latest platform|edt <линейка> | platform <версия> <каталог> | edt <версия> <каталог>" ;;
+latest)
+	credentials
+	latest "${2:?вид: platform или edt}" "${3:?линейка}"
+	;;
+platform)
+	credentials
+	platform "${2:?версия}" "${3:?каталог}"
+	;;
+edt)
+	credentials
+	edt "${2:?версия}" "${3:?каталог}"
+	;;
+help | --help | -h) usage ;;
+*)
+	usage >&2
+	exit 1
+	;;
 esac

@@ -1,0 +1,47 @@
+#!/bin/sh
+# Сервер 1С:Предприятия в контейнере:
+#   ragent [аргументы]    агент кластера и сервер администрирования ras; порты задают RAGENT_PORT (1540),
+#                         RAGENT_REGPORT (1541), RAGENT_RANGE (1560:1591) и RAS_PORT (1545, none - без ras)
+#   crserver [аргументы]  сервер хранилища конфигураций на CRSERVER_PORT (1542)
+#   другая команда        выполняется как есть
+# Данные серверов лежат в /home/usr1cv8/.1cv8. Запущенные от root ragent и crserver идут под usr1cv8,
+# а каталог данных с другим владельцем передаётся ему.
+set -eu
+
+data=/home/usr1cv8/.1cv8
+drop=
+
+as_usr1cv8() {
+	[ "$(id -u)" = 0 ] || return 0
+	mkdir -p "$data"
+	if [ "$(stat -c %u "$data")" != "$(id -u usr1cv8)" ]; then
+		chown -R usr1cv8:grp1cv8 "$data"
+	fi
+	drop='setpriv --reuid=usr1cv8 --regid=grp1cv8 --init-groups -- env HOME=/home/usr1cv8'
+}
+
+case ${1:-ragent} in
+ragent)
+	[ $# -eq 0 ] || shift
+	as_usr1cv8
+	# shellcheck disable=SC2086
+	$drop mkdir -p "$data/1C/1cv8"
+	port=${RAGENT_PORT:-1540}
+	if [ "${RAS_PORT:-1545}" != none ]; then
+		# shellcheck disable=SC2086
+		$drop ras cluster --port="${RAS_PORT:-1545}" "localhost:$port" &
+	fi
+	# shellcheck disable=SC2086
+	exec $drop ragent -port "$port" -regport "${RAGENT_REGPORT:-1541}" -range "${RAGENT_RANGE:-1560:1591}" \
+		-d "$data/1C/1cv8" "$@"
+	;;
+crserver)
+	shift
+	as_usr1cv8
+	# shellcheck disable=SC2086
+	exec $drop crserver -port "${CRSERVER_PORT:-1542}" -d "$data" "$@"
+	;;
+*)
+	exec "$@"
+	;;
+esac

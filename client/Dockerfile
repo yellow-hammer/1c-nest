@@ -1,21 +1,31 @@
-# Платформа 1С:Предприятие для Linux: ibcmd, ibsrv, сервер, конфигуратор, толстый и тонкий клиенты.
-# Установщик setup-full-<версия>-x86_64.run подключается именованным контекстом и в слои не попадает:
-#   docker build --build-context distr=<каталог с установщиком> --build-arg ONEC_VERSION=<версия> \
-#     -t platform:<версия> platform
+# Клиент 1С:Предприятия для Linux: конфигуратор, толстый и тонкий клиенты, ibcmd, ibsrv и сервер.
+# Дистрибутив скачивается при сборке, учётная запись releases.1c.ru передаётся секретами из переменных
+# ONEC_LOGIN и ONEC_PASSWORD:
+#   docker build --secret id=ONEC_LOGIN --secret id=ONEC_PASSWORD --build-arg ONEC_VERSION=<версия> \
+#     -t client:<версия> client
+# Каталог со скачанным дистрибутивом (setup-full-<версия>-x86_64.run) подставляется вместо скачивания:
+#   docker build --build-context distr=<каталог> --build-arg ONEC_VERSION=<версия> -t client:<версия> client
 # Цель runtime собирается без платформы: окружение, пользователь и дисплей.
 # Контейнер стартует от root; 1c-nest-display запускает команду под владельцем рабочего каталога.
 
+ARG DOWNLOADER_IMAGE=ghcr.io/yellow-hammer/1c-nest/downloader:latest
 ARG BASE_IMAGE=ubuntu:22.04
+
+FROM ${DOWNLOADER_IMAGE} AS distr
+ARG ONEC_VERSION
+RUN --mount=type=secret,id=ONEC_LOGIN,env=ONEC_LOGIN,required=true \
+    --mount=type=secret,id=ONEC_PASSWORD,env=ONEC_PASSWORD,required=true \
+    onec-download platform "${ONEC_VERSION:?}" /distr
 
 FROM ${BASE_IMAGE} AS install
 ARG ONEC_VERSION
 SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
 RUN --mount=type=bind,source=deps.sh,target=/tmp/deps.sh \
     bash /tmp/deps.sh install "${ONEC_VERSION:?}"
-RUN --mount=type=bind,from=distr,target=/distr <<'EOF'
-installer=$(find /distr -type f -name "setup-full-${ONEC_VERSION}-x86_64.run" | head -1)
+RUN --mount=type=bind,from=distr,target=/mnt/distr <<'EOF'
+installer=$(find /mnt/distr -type f -name "setup-full-${ONEC_VERSION}-x86_64.run" | head -1)
 if [ -z "$installer" ]; then
-	echo "В контексте distr нет setup-full-${ONEC_VERSION}-x86_64.run" >&2
+	echo "В дистрибутиве нет setup-full-${ONEC_VERSION}-x86_64.run" >&2
 	exit 1
 fi
 install -m 0755 "$installer" /tmp/setup-full.run
@@ -62,12 +72,20 @@ WORKDIR /workspace
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["bash"]
 
-FROM runtime AS platform
+FROM runtime AS client
 ARG ONEC_VERSION
 COPY --from=install /opt/1cv8 /opt/1cv8
-RUN ! ldd /opt/1cv8/current/ibcmd /opt/1cv8/current/ibsrv /opt/1cv8/current/1cv8 /opt/1cv8/current/1cv8c \
-      | grep 'not found' \
- && ibcmd --version
+# Системных библиотек должно хватать всем программам и модулям платформы
+RUN <<'EOF'
+cd /opt/1cv8/current
+missing=$(find . -maxdepth 1 -type f \( -name '*.so*' -o -perm -u+x \) -print0 |
+	LD_LIBRARY_PATH=$PWD xargs -0 -n1 sh -c 'ldd "$0" 2>/dev/null | sed -n "s|.* => not found|$0: &|p"')
+if [ -n "$missing" ]; then
+	echo "$missing" >&2
+	exit 1
+fi
+ibcmd --version
+EOF
 ENV ONEC_VERSION=${ONEC_VERSION}
 LABEL org.opencontainers.image.title="1C:Enterprise ${ONEC_VERSION}" \
       org.opencontainers.image.version="${ONEC_VERSION}"
