@@ -1,0 +1,136 @@
+#!/bin/bash
+# Дистрибутивы 1С с releases.1c.ru через yard.
+#   distr.sh latest platform <линейка>   последняя сборка линейки: 8.3.27 -> 8.3.27.2342
+#   distr.sh latest edt <линейка>        2026.1 -> 2026.1.3
+#   distr.sh platform <версия> <каталог> установщик setup-full-<версия>-x86_64.run
+#   distr.sh edt <версия> <каталог>      распакованный офлайн-дистрибутив 1C:EDT для Linux
+# Учётные данные: YARD_RELEASES_USER, YARD_RELEASES_PWD. Нужны yard, jq, unzip, tar.
+set -euo pipefail
+shopt -s inherit_errexit
+
+log() {
+	printf '%s\n' "$*" >&2
+}
+
+die() {
+	log "$*"
+	exit 1
+}
+
+if [ -n "${YARD_OS:-}" ]; then
+	yard=(oscript "$YARD_OS")
+else
+	yard=(yard)
+fi
+
+# Фильтры yard - регулярные выражения без привязки к началу и концу строки
+escape() {
+	# shellcheck disable=SC2016
+	printf '%s' "$1" | sed 's/[][\.*^$()+?{}|]/\\&/g'
+}
+
+platform_app() {
+	printf '^Технологическая платформа %s$' "$(escape "$(cut -d. -f1,2 <<<"$1")")"
+}
+
+edt_app() {
+	printf '^1C:Enterprise Development Tools$'
+}
+
+# yard не повторяет запросы и завершается с кодом 0, когда ничего не нашёл:
+# итог проверяет команда из первого аргумента.
+# В журнале yard прямые ссылки на файлы дистрибутива: он печатается только при ошибке и без них
+attempt() {
+	local check=$1 try output
+	shift
+	output=$(mktemp)
+	for try in 1 2 3; do
+		timeout "${YARD_TIMEOUT:-1800}" "${yard[@]}" "$@" >"$output" 2>&1 || true
+		if eval "$check"; then
+			rm -f "$output"
+			return 0
+		fi
+		log "Попытка $try не удалась:"
+		tail -20 "$output" | sed -E 's#([a-z]+://)?[^[:space:]"<>]*1c\.ru[^[:space:]"<>]*#<ссылка>#g; s#[a-z]+://[^[:space:]"<>]+#<ссылка>#g' >&2
+		[ "$try" = 3 ] || sleep $((try * 30))
+	done
+	rm -f "$output"
+	return 1
+}
+
+latest() {
+	local kind=$1 line=$2 app work list
+	case $kind in
+	platform) app=$(platform_app "$line") ;;
+	edt) app=$(edt_app) ;;
+	*) die "Неизвестный вид: $kind" ;;
+	esac
+	work=$(mktemp -d)
+	list="$work/list.json"
+	attempt "[ -s '$list' ]" releases list \
+		--app-filter "$app" \
+		--version-filter "^$(escape "$line")\\.[0-9]+\$" \
+		--output-file "$list" ||
+		die "Список версий $line не получен"
+	jq -r '.[] | .["Версии"][] | select(.["Бета"] != true) | .["Версия"]' "$list" |
+		grep -E "^$(escape "$line")\\.[0-9]+\$" | sort -V | tail -1 | grep . ||
+		die "В линейке $line нет версий"
+	rm -rf "$work"
+}
+
+# $1 - версия, $2 - фильтр приложения, $3 - фильтр дистрибутива, $4 - маска архива
+download() {
+	local version=$1 app=$2 distr=$3 mask=$4 work check
+	work=$(mktemp -d)
+	check="archive=\$(find '$work' -type f -name '$mask' | head -1); [ -n \"\$archive\" ] && \
+{ unzip -tq \"\$archive\" >/dev/null 2>&1 || gzip -t \"\$archive\" 2>/dev/null; } || { rm -rf '$work'/*; false; }"
+	attempt "$check" releases get \
+		--app-filter "$app" \
+		--version-filter "^$(escape "$version")\$" \
+		--distr-filter "$distr" \
+		--path "$work" \
+		--download-only ||
+		die "Дистрибутив $version не получен"
+	find "$work" -type f -name "$mask" | head -1
+}
+
+unpack() {
+	local archive=$1 dest=$2
+	mkdir -p "$dest"
+	case $archive in
+	*.zip) unzip -q "$archive" -d "$dest" ;;
+	*.tar.gz) tar -xzf "$archive" -C "$dest" ;;
+	*) die "Неизвестный архив: $archive" ;;
+	esac
+	rm -rf "$(dirname "$archive")"
+}
+
+platform() {
+	local version=$1 dest=$2 archive
+	archive=$(download "$version" "$(platform_app "$version")" \
+		'Технологическая платформа.+\(64-bit\) для Linux$' 'server64_*')
+	unpack "$archive" "$dest"
+	find "$dest" -type f -name "setup-full-$version-x86_64.run" | grep . ||
+		die "В дистрибутиве $version нет setup-full-$version-x86_64.run"
+}
+
+edt() {
+	local version=$1 dest=$2 distr archive
+	# Название офлайн-дистрибутива сменилось в 2023.3
+	if [ "$(printf '%s\n' 2023.3 "$version" | sort -V | head -1)" = 2023.3 ]; then
+		distr='Дистрибутив 1C:EDT для ОС Linux для установки без интернета$'
+	else
+		distr='Дистрибутив для оффлайн установки 1C:EDT для ОС Linux 64 бит$'
+	fi
+	archive=$(download "$version" "$(edt_app)" "$distr" '1c_edt_distr_offline_*.tar.gz')
+	unpack "$archive" "$dest"
+	find "$dest" -type f -name 1ce-installer-cli | grep . ||
+		die "В дистрибутиве EDT $version нет 1ce-installer-cli"
+}
+
+case ${1:-} in
+latest) latest "${2:?вид: platform или edt}" "${3:?линейка}" ;;
+platform) platform "${2:?версия}" "${3:?каталог}" ;;
+edt) edt "${2:?версия}" "${3:?каталог}" ;;
+*) die "Использование: distr.sh latest platform|edt <линейка> | platform <версия> <каталог> | edt <версия> <каталог>" ;;
+esac

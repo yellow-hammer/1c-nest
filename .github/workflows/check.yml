@@ -1,0 +1,47 @@
+name: Проверка
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Скрипты и workflow
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Получить код
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: shellcheck
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo koalaman/shellcheck-alpine:v0.11.0 sh -c '
+            shellcheck scripts/*.sh platform/deps.sh tests/smoke.sh tests/display/run.sh &&
+            shellcheck -s sh platform/rootfs/usr/local/bin/1c-nest-display vrunner/rootfs/usr/local/bin/vrunner \
+              edt/1cedtcli.in tests/display/fake-vrunner'
+
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color
+
+  display:
+    name: OneScript, vanessa-runner и дисплей без 1С
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Получить код
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Проверить
+        run: bash tests/display/run.sh

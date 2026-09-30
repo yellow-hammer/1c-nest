@@ -1,0 +1,14 @@
+#!/bin/sh
+# vanessa-runner с X-дисплеем для клиента 1С, см. 1c-nest-display
+real=${ONEC_NEST_VRUNNER:-/usr/local/libexec/1c-nest/vrunner}
+case ${1:-} in
+'' | version | --version | -v | help | --help | -h)
+	exec "$real" "$@"
+	;;
+esac
+for arg in "$@"; do
+	if [ "$arg" = --no-wait ]; then
+		echo '1c-nest: с --no-wait клиент 1С закроется вместе с контейнером' >&2
+	fi
+done
+exec /usr/local/bin/1c-nest-display "$real" "$@"

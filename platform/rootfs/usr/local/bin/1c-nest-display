@@ -1,0 +1,233 @@
+#!/bin/sh
+# Запускает команду с X-дисплеем для клиента 1С:
+#   DISPLAY задан      - дисплей хоста (проброс X11, WSLg);
+#   ONEC_NEST_VNC=1    - общий на контейнер Xvfb с оконным менеджером, x11vnc и noVNC;
+#   иначе              - свой Xvfb на время команды.
+# ONEC_NEST_DISPLAY=none запускает команду без дисплея.
+#
+# Сигнал TERM, INT или HUP получает вся сессия команды, и обёртка ждёт её процессы
+# до ONEC_NEST_STOP_GRACE секунд (по умолчанию 5).
+#
+# Запущенная от root команда идёт под владельцем рабочего каталога, если это не root
+# и не задано ONEC_NEST_AS_OWNER=0.
+
+set -u
+
+log() {
+	printf '1c-nest: %s\n' "$*" >&2
+}
+
+if [ $# -eq 0 ]; then
+	log 'использование: 1c-nest-display команда [аргументы]'
+	exit 2
+fi
+
+if [ "$(id -u)" = 0 ] && [ "${ONEC_NEST_AS_OWNER:-1}" != 0 ]; then
+	owner=$(stat -c %u:%g .)
+	if [ "${owner%%:*}" != 0 ]; then
+		exec setpriv --reuid="${owner%%:*}" --regid="${owner#*:}" --clear-groups -- "$0" "$@"
+	fi
+fi
+
+screen=${ONEC_NEST_SCREEN:-1920x1080x24}
+xvfb_pid=
+xvfb_dir=
+child=
+caught=
+
+home_usable() {
+	[ -n "${HOME:-}" ] && [ "$HOME" != / ] && [ -d "$HOME" ] && [ -w "$HOME" ] || return 1
+	for sub in .1cv8 .1C; do
+		[ ! -e "$HOME/$sub" ] || [ -w "$HOME/$sub" ] || return 1
+	done
+}
+
+fix_home() {
+	home_usable && return 0
+	HOME=$(getent passwd "$(id -u)" | cut -d: -f6)
+	home_usable && { export HOME; return 0; }
+	HOME="/tmp/1c-nest-home-$(id -u)"
+	mkdir -p "$HOME" && chmod 700 "$HOME"
+	export HOME
+}
+
+# Платформа падает, если у пользователя нет записи в /etc/passwd (docker run --user)
+fix_passwd() {
+	id -un >/dev/null 2>&1 && return 0
+	lib=/usr/lib/x86_64-linux-gnu/libnss_wrapper.so
+	[ -r "$lib" ] || return 0
+	nss="/tmp/1c-nest-nss-$(id -u)"
+	mkdir -p "$nss" || return 0
+	tmp=$(mktemp "$nss/passwd.XXXXXX") || return 0
+	{ printf 'onec:x:%s:%s:1C:%s:/bin/sh\n' "$(id -u)" "$(id -g)" "$HOME"; cat /etc/passwd; } >"$tmp"
+	mv -f "$tmp" "$nss/passwd"
+	tmp=$(mktemp "$nss/group.XXXXXX") || return 0
+	cat /etc/group >"$tmp"
+	grep -q "^[^:]*:[^:]*:$(id -g):" /etc/group || printf 'onec:x:%s:\n' "$(id -g)" >>"$tmp"
+	mv -f "$tmp" "$nss/group"
+	NSS_WRAPPER_PASSWD="$nss/passwd"
+	NSS_WRAPPER_GROUP="$nss/group"
+	LD_PRELOAD="$lib${LD_PRELOAD:+ $LD_PRELOAD}"
+	export NSS_WRAPPER_PASSWD NSS_WRAPPER_GROUP LD_PRELOAD
+}
+
+# $1 - файл, куда Xvfb пишет номер дисплея, $2 - pid Xvfb, $3 - журнал Xvfb
+await_display() {
+	tries=0
+	while [ ! -s "$1" ]; do
+		if ! kill -0 "$2" 2>/dev/null; then
+			log 'Xvfb не запустился:'
+			cat "$3" >&2
+			return 1
+		fi
+		tries=$((tries + 1))
+		if [ "$tries" -gt 300 ]; then
+			log 'Xvfb не ответил за 30 с'
+			return 1
+		fi
+		sleep 0.1
+	done
+	DISPLAY=":$(head -n 1 "$1")"
+	export DISPLAY
+}
+
+start_private_xvfb() {
+	xvfb_dir=$(mktemp -d /tmp/1c-nest-xvfb.XXXXXX) || return 1
+	: >"$xvfb_dir/display"
+	# -displayfd: сервер сам берёт свободный номер и сообщает его, когда готов
+	Xvfb -displayfd 5 -screen 0 "$screen" -nolisten tcp \
+		5>"$xvfb_dir/display" >"$xvfb_dir/xvfb.log" 2>&1 </dev/null &
+	xvfb_pid=$!
+	await_display "$xvfb_dir/display" "$xvfb_pid" "$xvfb_dir/xvfb.log"
+}
+
+vnc_stack_alive() {
+	[ -s "$1/xvfb.pid" ] && kill -0 "$(cat "$1/xvfb.pid")" 2>/dev/null
+}
+
+launch_vnc_stack() {
+	dir=$1
+	: >"$dir/display"
+	setsid Xvfb "${ONEC_NEST_VNC_DISPLAY:-:0}" -displayfd 5 -screen 0 "$screen" -nolisten tcp \
+		5>"$dir/display" >"$dir/xvfb.log" 2>&1 </dev/null 8>&- &
+	echo $! >"$dir/xvfb.pid"
+	await_display "$dir/display" "$(cat "$dir/xvfb.pid")" "$dir/xvfb.log" || return 1
+	setsid fluxbox >"$dir/wm.log" 2>&1 </dev/null 8>&- &
+	if [ -n "${VNC_PASSWORD:-}" ]; then
+		x11vnc -storepasswd "$VNC_PASSWORD" "$dir/passwd" >/dev/null 2>&1
+		set -- -rfbauth "$dir/passwd"
+	else
+		set -- -nopw
+	fi
+	# x11vnc сам отдаёт страницы noVNC и принимает WebSocket на порту VNC
+	setsid x11vnc -display "$DISPLAY" -rfbport "$vnc_port" -httpdir /usr/share/novnc -httpport "$web_port" \
+		-noipv6 -forever -shared -quiet "$@" >"$dir/x11vnc.log" 2>&1 </dev/null 8>&- &
+}
+
+start_vnc_stack() {
+	dir=/tmp/1c-nest-vnc
+	vnc_port=${VNC_PORT:-5900}
+	web_port=${NOVNC_PORT:-6080}
+	mkdir -p "$dir" 2>/dev/null || return 1
+	# ошибка перенаправления у exec завершила бы всю обёртку
+	[ -w "$dir/lock" ] || { [ ! -e "$dir/lock" ] && [ -w "$dir" ]; } || return 1
+	exec 8>"$dir/lock"
+	flock 8
+	if vnc_stack_alive "$dir"; then
+		DISPLAY=${ONEC_NEST_VNC_DISPLAY:-:0}
+		export DISPLAY
+		started=0
+	else
+		launch_vnc_stack "$dir"
+		started=$?
+	fi
+	flock -u 8
+	exec 8>&-
+	return "$started"
+}
+
+# Процессы сессии команды: у setsid номер сессии равен pid
+session_pids() {
+	pgrep -s "$child" 2>/dev/null
+}
+
+# Как терминал: сигнал всем процессам сессии команды
+# shellcheck disable=SC2317,SC2329 # вызывается из trap
+forward() {
+	caught=$1
+	if [ -n "$child" ]; then
+		pkill --signal "$1" -s "$child" 2>/dev/null || kill -s "$1" "$child" 2>/dev/null
+	fi
+}
+
+# shellcheck disable=SC2317,SC2329 # вызывается из trap
+cleanup() {
+	if [ -n "$xvfb_pid" ]; then
+		kill "$xvfb_pid" 2>/dev/null
+		wait "$xvfb_pid" 2>/dev/null
+	fi
+	if [ -n "$xvfb_dir" ]; then
+		rm -rf "$xvfb_dir"
+	fi
+}
+
+trap 'forward TERM' TERM
+trap 'forward INT' INT
+trap 'forward HUP' HUP
+trap cleanup EXIT
+
+fix_home
+fix_passwd
+
+case ${ONEC_NEST_DISPLAY:-auto} in
+none) ;;
+*)
+	if [ -n "${DISPLAY:-}" ]; then
+		:
+	elif [ "${ONEC_NEST_VNC:-0}" = 1 ] && start_vnc_stack; then
+		:
+	else
+		if [ "${ONEC_NEST_VNC:-0}" = 1 ]; then
+			log 'VNC не поднялся, окна клиента видны не будут'
+		fi
+		start_private_xvfb || log 'Xvfb не поднялся, команда идёт без дисплея'
+	fi
+	;;
+esac
+unset VNC_PASSWORD
+# Шина, которую клиент 1С поднимает сам, живёт до закрытия дисплея и держала бы запуск
+if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+	DBUS_SESSION_BUS_ADDRESS=disabled:
+	export DBUS_SESSION_BUS_ADDRESS
+fi
+
+# Фоновой команде sh подставляет /dev/null вместо stdin и игнорирует для неё
+# SIGINT и SIGQUIT: вход передаётся через дескриптор 3, сигналы возвращает env.
+# Своя сессия: сигнал приходит команде один раз, от обёртки
+exec 3<&0
+setsid env --default-signal=INT,QUIT "$@" <&3 3<&- &
+child=$!
+exec 3<&-
+
+rc=0
+while :; do
+	wait "$child"
+	rc=$?
+	kill -0 "$child" 2>/dev/null || break
+done
+
+# Остановка: оставшимся процессам сессии время закрыться
+if [ -n "$caught" ]; then
+	tries=$((${ONEC_NEST_STOP_GRACE:-5} * 10))
+	while [ "$tries" -gt 0 ] && [ -n "$(session_pids)" ]; do
+		sleep 0.1
+		tries=$((tries - 1))
+	done
+fi
+
+case $caught in
+TERM) exit 143 ;;
+INT) exit 130 ;;
+HUP) exit 129 ;;
+esac
+exit "$rc"
